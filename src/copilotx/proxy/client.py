@@ -197,10 +197,11 @@ class CopilotClient:
                     request=resp.request,
                     response=resp,
                 )
+            # Preserve empty lines as SSE event delimiters. Some clients (Codex CLI)
+            # require proper event framing and can treat streams as incomplete if
+            # delimiters are stripped.
             async for line in resp.aiter_lines():
-                if line:
-                    yield (line + "\n").encode("utf-8")
-            yield b"\n"
+                yield (line + "\n").encode("utf-8")
 
     # ── Private helpers ─────────────────────────────────────────────
 

@@ -137,7 +137,9 @@ async def fix_responses_stream(
     async for raw_line in raw_lines:
         line = raw_line.decode("utf-8").rstrip("\n")
 
+        # Preserve SSE event delimiters between events.
         if not line:
+            yield b"\n"
             continue
 
         # Pass through non-data lines (event: lines, comments, etc.)
