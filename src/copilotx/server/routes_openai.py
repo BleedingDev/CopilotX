@@ -55,6 +55,28 @@ def _should_fallback_to_responses(exc: Exception) -> bool:
     )
 
 
+def _responses_request_has_vision_input(payload: dict) -> bool:
+    """Check whether a translated Responses payload contains image input."""
+    input_data = payload.get("input")
+    if not isinstance(input_data, list):
+        return False
+
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in (
+                "input_image",
+                "image",
+                "image_url",
+            ):
+                return True
+    return False
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI-compatible chat completions endpoint.
@@ -64,6 +86,7 @@ async def chat_completions(request: Request):
     body = await request.json()
     model = body.get("model")
     responses_payload = openai_chat_to_responses_request(body)
+    vision = _responses_request_has_vision_input(responses_payload)
 
     try:
         if body.get("stream", False):
@@ -87,7 +110,7 @@ async def chat_completions(request: Request):
                     model=model,
                     operation=lambda client: client.responses(
                         deepcopy(responses_payload),
-                        vision=False,
+                        vision=vision,
                         initiator="user",
                     ),
                 )
@@ -109,7 +132,7 @@ async def chat_completions(request: Request):
                 model=model,
                 operation=lambda client: client.responses(
                     deepcopy(responses_payload),
-                    vision=False,
+                    vision=vision,
                     initiator="user",
                 ),
             )

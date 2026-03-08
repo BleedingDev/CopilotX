@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from copilotx.auth.accounts import AccountRecord, AccountRepository
 from copilotx.auth.pool import TokenPool
+from copilotx.proxy.translator import openai_responses_to_chat_request
 from copilotx.server.app import create_app
 
 
@@ -694,6 +695,125 @@ def test_openai_stream_falls_back_to_responses_for_responses_only_models(
     assert "gpt54 stream ok" in response.text
     assert "data: [DONE]" in response.text
     assert state["token-1"]["responses_calls"] == 1
+
+
+def test_openai_responses_to_chat_request_preserves_string_input() -> None:
+    payload = openai_responses_to_chat_request(
+        {
+            "model": "claude-sonnet-4.6",
+            "input": "Say hello.",
+        }
+    )
+
+    assert payload["messages"] == [{"role": "user", "content": "Say hello."}]
+
+
+def test_openai_responses_to_chat_request_maps_instructions_to_system_message() -> None:
+    payload = openai_responses_to_chat_request(
+        {
+            "model": "claude-sonnet-4.6",
+            "instructions": "Reply tersely.",
+            "input": "Say hello.",
+        }
+    )
+
+    assert payload["messages"][0] == {
+        "role": "system",
+        "content": "Reply tersely.",
+    }
+    assert payload["messages"][1] == {"role": "user", "content": "Say hello."}
+
+
+def test_openai_fallback_to_responses_preserves_vision_flag(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    captured: dict[str, object] = {}
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5.4"],
+            "errors": [
+                make_http_error(
+                    400,
+                    (
+                        '{"error":{"message":"model \\"gpt-5.4\\" is not accessible via '
+                        'the /chat/completions endpoint","code":"unsupported_api_for_model"}}'
+                    ),
+                )
+            ],
+            "responses_result": {
+                "id": "resp-openai-vision-1",
+                "model": "gpt-5.4",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "vision ok"}
+                        ],
+                    }
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 4},
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    class CapturingClient(FakeCopilotClient):
+        async def responses(
+            self,
+            payload: dict,
+            *,
+            vision: bool = False,
+            initiator: str = "user",
+        ) -> dict:
+            captured["payload"] = copy.deepcopy(payload)
+            captured["vision"] = vision
+            return await super().responses(
+                payload,
+                vision=vision,
+                initiator=initiator,
+            )
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: CapturingClient(
+            token,
+            api_base,
+            state,
+        ),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.4",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this image."},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://example.com/cat.png"},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "vision ok"
+    assert captured["vision"] is True
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["input"][0]["content"][1]["type"] == "input_image"
 
 
 def test_responses_non_stream_falls_back_to_chat_completions_for_chat_only_models(

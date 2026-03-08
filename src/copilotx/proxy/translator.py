@@ -741,10 +741,43 @@ def _responses_tool_choice_to_openai_chat(tool_choice: Any) -> Any:
     return tool_choice
 
 
+def _responses_instructions_to_chat_message(
+    instructions: Any,
+) -> dict[str, Any] | None:
+    """Convert Responses instructions into a leading chat system message."""
+    if instructions is None:
+        return None
+    if isinstance(instructions, str):
+        content = instructions
+    elif isinstance(instructions, list):
+        parts: list[str] = []
+        for item in instructions:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") in (
+                "input_text",
+                "output_text",
+                "text",
+            ):
+                parts.append(str(item.get("text", "")))
+        content = "\n".join(part for part in parts if part)
+    else:
+        content = str(instructions)
+
+    if not content:
+        return None
+    return {"role": "system", "content": content}
+
+
 def openai_responses_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
     """Convert an OpenAI Responses request to chat-completions format."""
     messages: list[dict[str, Any]] = []
     pending_tool_calls: list[dict[str, Any]] = []
+    instructions_message = _responses_instructions_to_chat_message(
+        body.get("instructions")
+    )
+    if instructions_message is not None:
+        messages.append(instructions_message)
 
     def flush_tool_calls() -> None:
         if not pending_tool_calls:
@@ -758,7 +791,17 @@ def openai_responses_to_chat_request(body: dict[str, Any]) -> dict[str, Any]:
         )
         pending_tool_calls.clear()
 
-    for item in body.get("input", []):
+    input_data = body.get("input", [])
+    if isinstance(input_data, str):
+        input_items: list[Any] = [{"role": "user", "content": input_data}]
+    elif isinstance(input_data, dict):
+        input_items = [input_data]
+    elif isinstance(input_data, list):
+        input_items = input_data
+    else:
+        input_items = []
+
+    for item in input_items:
         if not isinstance(item, dict):
             continue
 
