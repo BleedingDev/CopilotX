@@ -245,6 +245,7 @@ class TokenPool:
                 client = await entry.ensure_client()
                 models = await client.list_models()
                 entry.known_models = models
+                self._persist_client_rate_limit(entry, client)
                 self.repository.update_models(
                     entry.account.account_id,
                     [str(model.get("id")) for model in models if model.get("id")],
@@ -280,6 +281,22 @@ class TokenPool:
             if entry.cooldown_until > now and not entry.account.reauth_required
         ]
         reauth = [entry for entry in enabled_entries if entry.account.reauth_required]
+        observed_limits = [
+            entry
+            for entry in enabled_entries
+            if entry.account.request_limit is not None
+            or entry.account.request_remaining is not None
+        ]
+        limit_values = [
+            entry.account.request_limit
+            for entry in enabled_entries
+            if entry.account.request_limit is not None
+        ]
+        remaining_values = [
+            entry.account.request_remaining
+            for entry in enabled_entries
+            if entry.account.request_remaining is not None
+        ]
         return {
             "authenticated": bool(enabled_entries),
             "token_valid": bool(valid_expiries),
@@ -289,6 +306,25 @@ class TokenPool:
             "accounts_healthy": len(healthy),
             "accounts_cooling_down": len(cooling_down),
             "accounts_reauth_required": len(reauth),
+            "limits_accounts_observed": len(observed_limits),
+            "limits_total": sum(limit_values) if limit_values else None,
+            "limits_remaining": sum(remaining_values) if remaining_values else None,
+            "limits_next_reset_at": min(
+                (
+                    entry.account.request_reset_at
+                    for entry in enabled_entries
+                    if entry.account.request_reset_at > now
+                ),
+                default=0.0,
+            ),
+            "limits_last_updated_at": max(
+                (
+                    entry.account.request_limit_updated_at
+                    for entry in enabled_entries
+                    if entry.account.request_limit_updated_at > 0
+                ),
+                default=0.0,
+            ),
             "strategy": self.repository.get_rotation_strategy(),
         }
 
@@ -445,6 +481,7 @@ class TokenPool:
         if model and entry.known_model_ids and model not in entry.known_model_ids:
             models = await client.list_models()
             entry.known_models = models
+            self._persist_client_rate_limit(entry, client)
             model_ids = [str(item.get("id")) for item in models if item.get("id")]
             self.repository.update_models(entry.account.account_id, model_ids)
             if model not in model_ids:
@@ -498,6 +535,7 @@ class TokenPool:
 
     async def _handle_request_error(self, lease: AccountLease, exc: Exception) -> RetryDecision:
         entry = lease.entry
+        self._persist_client_rate_limit(entry, lease.client)
         now = time.time()
         if isinstance(exc, TokenError):
             lower = str(exc).lower()
@@ -553,6 +591,8 @@ class TokenPool:
     async def _mark_success(self, entry: PoolEntry) -> None:
         entry.error_streak = 0
         entry.cooldown_until = 0.0
+        if entry.client is not None:
+            self._persist_client_rate_limit(entry, entry.client)
         self.repository.mark_account(
             entry.account.account_id,
             reauth_required=False,
@@ -568,6 +608,31 @@ class TokenPool:
             entry.account.account_id,
             last_error=message,
             last_error_at=time.time(),
+        )
+
+    def _persist_client_rate_limit(self, entry: PoolEntry, client: CopilotClient) -> None:
+        snapshot = getattr(client, "last_rate_limit", None)
+        if snapshot is None or not snapshot.known:
+            return
+
+        if snapshot.limit is not None:
+            entry.account.request_limit = snapshot.limit
+        if snapshot.remaining is not None:
+            entry.account.request_remaining = snapshot.remaining
+        if snapshot.reset_at is not None:
+            entry.account.request_reset_at = snapshot.reset_at
+        if snapshot.source:
+            entry.account.request_limit_source = snapshot.source
+        if snapshot.observed_at:
+            entry.account.request_limit_updated_at = snapshot.observed_at
+
+        self.repository.update_rate_limit(
+            entry.account.account_id,
+            request_limit=entry.account.request_limit,
+            request_remaining=entry.account.request_remaining,
+            request_reset_at=entry.account.request_reset_at,
+            request_limit_source=entry.account.request_limit_source,
+            request_limit_updated_at=entry.account.request_limit_updated_at,
         )
 
 

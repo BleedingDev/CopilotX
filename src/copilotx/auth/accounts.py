@@ -40,6 +40,11 @@ class AccountRecord:
     last_used_at: float = 0.0
     last_error: str = ""
     last_error_at: float = 0.0
+    request_limit: int | None = None
+    request_remaining: int | None = None
+    request_reset_at: float = 0.0
+    request_limit_source: str = ""
+    request_limit_updated_at: float = 0.0
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -113,8 +118,9 @@ class AccountRepository:
                         account_id, github_login, github_user_id, label, github_token,
                         copilot_token, expires_at, api_base_url, enabled, reauth_required,
                         priority, model_ids_json, last_used_at, last_error, last_error_at,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        request_limit, request_remaining, request_reset_at,
+                        request_limit_source, request_limit_updated_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account.account_id,
@@ -132,6 +138,11 @@ class AccountRepository:
                         account.last_used_at,
                         account.last_error,
                         account.last_error_at,
+                        account.request_limit,
+                        account.request_remaining,
+                        account.request_reset_at,
+                        account.request_limit_source,
+                        account.request_limit_updated_at,
                         account.created_at,
                         account.updated_at,
                     ),
@@ -160,6 +171,11 @@ class AccountRepository:
                     last_used_at = ?,
                     last_error = ?,
                     last_error_at = ?,
+                    request_limit = ?,
+                    request_remaining = ?,
+                    request_reset_at = ?,
+                    request_limit_source = ?,
+                    request_limit_updated_at = ?,
                     updated_at = ?
                 WHERE account_id = ?
                 """,
@@ -177,6 +193,19 @@ class AccountRepository:
                     account.last_used_at or existing.last_used_at,
                     account.last_error,
                     account.last_error_at,
+                    (
+                        existing.request_limit
+                        if account.request_limit is None
+                        else account.request_limit
+                    ),
+                    (
+                        existing.request_remaining
+                        if account.request_remaining is None
+                        else account.request_remaining
+                    ),
+                    account.request_reset_at or existing.request_reset_at,
+                    account.request_limit_source or existing.request_limit_source,
+                    account.request_limit_updated_at or existing.request_limit_updated_at,
                     now,
                     existing.account_id,
                 ),
@@ -273,6 +302,55 @@ class AccountRepository:
             conn.execute(
                 "UPDATE accounts SET model_ids_json = ?, updated_at = ? WHERE account_id = ?",
                 (json.dumps(model_ids), time.time(), account_id),
+            )
+
+    def update_rate_limit(
+        self,
+        account_id: str,
+        *,
+        request_limit: int | None = None,
+        request_remaining: int | None = None,
+        request_reset_at: float | None = None,
+        request_limit_source: str | None = None,
+        request_limit_updated_at: float | None = None,
+    ) -> None:
+        account = self.get_account(account_id)
+        if account is None:
+            return
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE accounts
+                SET request_limit = ?,
+                    request_remaining = ?,
+                    request_reset_at = ?,
+                    request_limit_source = ?,
+                    request_limit_updated_at = ?,
+                    updated_at = ?
+                WHERE account_id = ?
+                """,
+                (
+                    account.request_limit if request_limit is None else request_limit,
+                    (
+                        account.request_remaining
+                        if request_remaining is None
+                        else request_remaining
+                    ),
+                    account.request_reset_at if request_reset_at is None else request_reset_at,
+                    (
+                        account.request_limit_source
+                        if request_limit_source is None
+                        else request_limit_source
+                    ),
+                    (
+                        account.request_limit_updated_at
+                        if request_limit_updated_at is None
+                        else request_limit_updated_at
+                    ),
+                    time.time(),
+                    account_id,
+                ),
             )
 
     def mark_account(
@@ -399,6 +477,11 @@ class AccountRepository:
                     last_used_at REAL NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
                     last_error_at REAL NOT NULL DEFAULT 0,
+                    request_limit INTEGER,
+                    request_remaining INTEGER,
+                    request_reset_at REAL NOT NULL DEFAULT 0,
+                    request_limit_source TEXT NOT NULL DEFAULT '',
+                    request_limit_updated_at REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 )
@@ -412,6 +495,26 @@ class AccountRepository:
                     updated_at REAL NOT NULL
                 )
                 """
+            )
+            self._ensure_column(conn, "accounts", "request_limit", "INTEGER")
+            self._ensure_column(conn, "accounts", "request_remaining", "INTEGER")
+            self._ensure_column(
+                conn,
+                "accounts",
+                "request_reset_at",
+                "REAL NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                conn,
+                "accounts",
+                "request_limit_source",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                conn,
+                "accounts",
+                "request_limit_updated_at",
+                "REAL NOT NULL DEFAULT 0",
             )
 
     def _migrate_legacy_auth(self) -> None:
@@ -504,6 +607,17 @@ class AccountRepository:
             last_used_at=float(row["last_used_at"]),
             last_error=str(row["last_error"]),
             last_error_at=float(row["last_error_at"]),
+            request_limit=(
+                int(row["request_limit"]) if row["request_limit"] is not None else None
+            ),
+            request_remaining=(
+                int(row["request_remaining"])
+                if row["request_remaining"] is not None
+                else None
+            ),
+            request_reset_at=float(row["request_reset_at"] or 0.0),
+            request_limit_source=str(row["request_limit_source"] or ""),
+            request_limit_updated_at=float(row["request_limit_updated_at"] or 0.0),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
         )
@@ -516,3 +630,18 @@ class AccountRepository:
             self.path.touch()
         if os.name != "nt":
             self.path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection,
+        table_name: str,
+        column_name: str,
+        definition: str,
+    ) -> None:
+        existing_columns = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name in existing_columns:
+            return
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")

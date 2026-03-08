@@ -51,6 +51,86 @@ def _format_duration(seconds: int) -> str:
     return f"{secs}s"
 
 
+def _format_request_budget(limit: int | None, remaining: int | None) -> str:
+    if limit is None and remaining is None:
+        return "unknown"
+    left = "?" if remaining is None else str(max(int(remaining), 0))
+    right = "?" if limit is None else str(max(int(limit), 0))
+    if limit not in {None, 0} and remaining is not None:
+        percent_remaining = round((max(int(remaining), 0) / int(limit)) * 100)
+        return f"{left}/{right} ({percent_remaining}%)"
+    return f"{left}/{right}"
+
+
+def _format_reset_time(reset_at: float, now: float) -> str:
+    if reset_at <= 0:
+        return "-"
+    return _format_duration(max(int(reset_at - now), 0))
+
+
+def _observed_budget_summary(accounts: list) -> str:
+    enabled_accounts = [account for account in accounts if account.enabled]
+    observed_accounts = [
+        account
+        for account in enabled_accounts
+        if account.request_limit is not None or account.request_remaining is not None
+    ]
+    if not observed_accounts:
+        return "Premium request budget: unknown"
+
+    total_limit = sum(
+        account.request_limit
+        for account in observed_accounts
+        if account.request_limit is not None
+    )
+    total_remaining = sum(
+        account.request_remaining
+        for account in observed_accounts
+        if account.request_remaining is not None
+    )
+    limit_text = (
+        str(total_limit)
+        if any(account.request_limit is not None for account in observed_accounts)
+        else "?"
+    )
+    remaining_text = (
+        str(total_remaining)
+        if any(account.request_remaining is not None for account in observed_accounts)
+        else "?"
+    )
+    return (
+        f"Premium request budget: {remaining_text}/{limit_text} remaining across "
+        f"{len(observed_accounts)}/{len(enabled_accounts)} enabled account(s)"
+    )
+
+
+def _refresh_account_usage(repo) -> None:
+    from copilotx.auth.token import fetch_copilot_usage
+
+    async def _refresh() -> None:
+        accounts = repo.list_accounts(enabled_only=True)
+
+        async def _refresh_account(account) -> None:
+            try:
+                snapshot = await fetch_copilot_usage(account.github_token)
+            except Exception:
+                return
+            if snapshot is None:
+                return
+            repo.update_rate_limit(
+                account.account_id,
+                request_limit=snapshot.limit,
+                request_remaining=snapshot.remaining,
+                request_reset_at=snapshot.reset_at,
+                request_limit_source=snapshot.source,
+                request_limit_updated_at=snapshot.observed_at,
+            )
+
+        await asyncio.gather(*[_refresh_account(account) for account in accounts])
+
+    asyncio.run(_refresh())
+
+
 def _render_account_table(repo) -> None:
     from copilotx.config import TOKEN_REFRESH_BUFFER
 
@@ -65,12 +145,15 @@ def _render_account_table(repo) -> None:
     strategy = repo.get_rotation_strategy()
     console.print(f"[bold green]✅ {len(accounts)} account(s) configured[/]")
     console.print(f"[dim]   Rotation strategy: {strategy}[/]")
+    console.print(f"[dim]   {_observed_budget_summary(accounts)}[/]")
 
     table = Table(title="🔐 Upstream Accounts", show_lines=False)
     table.add_column("Account", style="cyan", no_wrap=True)
     table.add_column("GitHub", style="white")
     table.add_column("State", style="white")
     table.add_column("Token", style="dim")
+    table.add_column("Premium Requests", style="magenta", justify="right")
+    table.add_column("Reset", style="dim")
     table.add_column("Priority", style="dim", justify="right")
 
     for account in accounts:
@@ -103,6 +186,8 @@ def _render_account_table(repo) -> None:
             account.github_login or "legacy",
             state,
             token_state,
+            _format_request_budget(account.request_limit, account.request_remaining),
+            _format_reset_time(account.request_reset_at, now),
             str(account.priority),
         )
 
@@ -234,6 +319,7 @@ def auth_status() -> None:
     """Show current authentication status."""
     repo = _account_repository()
     if repo.has_accounts():
+        _refresh_account_usage(repo)
         _render_account_table(repo)
         return
 
@@ -593,6 +679,7 @@ def serve(
     runtime = None
 
     if use_pool:
+        _refresh_account_usage(repo)
         try:
             models, pool_health = _load_models_via_pool(repo)
             model_names = [m["id"] for m in models]

@@ -8,9 +8,12 @@ from pathlib import Path
 
 import httpx
 from fastapi.testclient import TestClient
+from rich.console import Console
 
+from copilotx import cli as cli_module
 from copilotx.auth.accounts import AccountRecord, AccountRepository
 from copilotx.auth.pool import TokenPool
+from copilotx.proxy.client import RateLimitSnapshot
 from copilotx.proxy.translator import openai_responses_to_chat_request
 from copilotx.server.app import create_app
 from copilotx.server.runtime import ModelRoutingRegistry
@@ -80,6 +83,7 @@ class FakeCopilotClient:
         self.token = token
         self.api_base_url = api_base_url
         self.state = state
+        self.last_rate_limit: RateLimitSnapshot | None = None
 
     async def __aenter__(self) -> "FakeCopilotClient":
         return self
@@ -95,10 +99,12 @@ class FakeCopilotClient:
 
     async def list_models(self) -> list[dict]:
         account = self.state[self.token]
+        self.last_rate_limit = copy.deepcopy(account.get("rate_limit"))
         return [{"id": model_id, "vendor": "test"} for model_id in account["models"]]
 
     async def chat_completions(self, payload: dict) -> dict:
         account = self.state[self.token]
+        self.last_rate_limit = copy.deepcopy(account.get("rate_limit"))
         account["chat_calls"] += 1
         if account["errors"]:
             raise account["errors"].pop(0)
@@ -137,6 +143,7 @@ class FakeCopilotClient:
         initiator: str = "user",
     ) -> dict:
         account = self.state[self.token]
+        self.last_rate_limit = copy.deepcopy(account.get("rate_limit"))
         account["responses_calls"] = account.get("responses_calls", 0) + 1
         if account.get("responses_errors"):
             raise account["responses_errors"].pop(0)
@@ -329,6 +336,145 @@ def test_openai_route_uses_token_pool_runtime(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json()["account"] == "alpha"
     assert state["token-1"]["chat_calls"] == 1
+
+
+def test_token_pool_persists_request_budget_from_upstream_client(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    observed_at = time.time()
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5.4"],
+            "errors": [],
+            "chat_calls": 0,
+            "rate_limit": RateLimitSnapshot(
+                limit=80,
+                remaining=57,
+                reset_at=observed_at + 120,
+                source="x-ratelimit-limit",
+                observed_at=observed_at,
+            ),
+        }
+    }
+
+    async def run() -> dict:
+        pool = TokenPool(
+            repo,
+            client_factory=lambda token, api_base: FakeCopilotClient(
+                token,
+                api_base,
+                state,
+            ),
+        )
+        try:
+            return await pool.execute(
+                model="gpt-5.4",
+                operation=lambda client: client.chat_completions({"model": "gpt-5.4"}),
+            )
+        finally:
+            await pool.__aexit__(None, None, None)
+
+    result = asyncio.run(run())
+    saved = repo.get_account("acct-1")
+
+    assert result["account"] == "alpha"
+    assert saved is not None
+    assert saved.request_limit == 80
+    assert saved.request_remaining == 57
+    assert saved.request_reset_at == observed_at + 120
+    assert saved.request_limit_source == "x-ratelimit-limit"
+    assert saved.request_limit_updated_at == observed_at
+
+
+def test_health_reports_aggregate_request_budget(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+    repo.upsert_account(make_account("acct-2", "beta", "gh-2", "token-2"))
+
+    observed_at = time.time()
+    repo.update_rate_limit(
+        "acct-1",
+        request_limit=80,
+        request_remaining=50,
+        request_reset_at=observed_at + 120,
+        request_limit_source="x-ratelimit-limit",
+        request_limit_updated_at=observed_at,
+    )
+    repo.update_rate_limit(
+        "acct-2",
+        request_limit=40,
+        request_remaining=10,
+        request_reset_at=observed_at + 240,
+        request_limit_source="x-ratelimit-limit",
+        request_limit_updated_at=observed_at,
+    )
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5.4"],
+            "errors": [],
+            "chat_calls": 0,
+        },
+        "token-2": {
+            "name": "beta",
+            "models": ["gpt-5.4"],
+            "errors": [],
+            "chat_calls": 0,
+        },
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(
+            token,
+            api_base,
+            state,
+        ),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        health = client.get("/health")
+
+    assert health.status_code == 200
+    assert health.json()["limits_accounts_observed"] == 2
+    assert health.json()["limits_total"] == 120
+    assert health.json()["limits_remaining"] == 60
+    assert health.json()["limits_next_reset_at"] == observed_at + 120
+    assert health.json()["limits_last_updated_at"] == observed_at
+
+
+def test_render_account_table_shows_per_account_request_budget(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+    repo.upsert_account(make_account("acct-2", "beta", "gh-2", "token-2"))
+
+    observed_at = time.time()
+    repo.update_rate_limit(
+        "acct-1",
+        request_limit=80,
+        request_remaining=50,
+        request_reset_at=observed_at + 120,
+        request_limit_source="x-ratelimit-limit",
+        request_limit_updated_at=observed_at,
+    )
+
+    original_console = cli_module.console
+    cli_module.console = Console(record=True, width=160)
+    try:
+        cli_module._render_account_table(repo)
+        output = cli_module.console.export_text()
+    finally:
+        cli_module.console = original_console
+
+    assert "Premium request budget: 50/80 remaining across 1/2 enabled account(s)" in output
+    assert "alpha *" in output
+    assert "50/80 (62%)" in output
+    assert "beta" in output
+    assert "unknown" in output
 
 
 def test_api_key_middleware_trusts_localhost_by_default(

@@ -10,6 +10,7 @@ GITHUB_SCOPE = "read:user"
 GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
 GITHUB_COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
+GITHUB_COPILOT_USER_URL = "https://api.github.com/copilot_internal/user"
 
 # ── Copilot API ────────────────────────────────────────────────────
 # The correct API base URL is read dynamically from the token response

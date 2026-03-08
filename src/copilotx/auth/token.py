@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
+from datetime import datetime
 
 import httpx
 from rich.console import Console
@@ -12,6 +14,7 @@ from copilotx.config import (
     COPILOT_API_BASE_FALLBACK,
     COPILOT_HEADERS,
     GITHUB_COPILOT_TOKEN_URL,
+    GITHUB_COPILOT_USER_URL,
     TOKEN_REFRESH_BUFFER,
 )
 
@@ -20,6 +23,18 @@ console = Console()
 
 class TokenError(Exception):
     """Raised when token operations fail."""
+
+
+@dataclass(slots=True)
+class CopilotUsageSnapshot:
+    """Premium request usage exposed by GitHub's internal Copilot user endpoint."""
+
+    limit: int | None = None
+    remaining: int | None = None
+    percent_remaining: float | None = None
+    reset_at: float = 0.0
+    observed_at: float = 0.0
+    source: str = "copilot_internal/user:premium_interactions"
 
 
 class TokenManager:
@@ -147,6 +162,65 @@ async def fetch_copilot_token(github_token: str) -> tuple[str, float, str]:
         api_base_url = endpoints.get("api", "")
 
         return token, expires_at, api_base_url
+
+
+async def fetch_copilot_usage(github_token: str) -> CopilotUsageSnapshot | None:
+    """Fetch current premium request usage for the signed-in GitHub account."""
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        **COPILOT_HEADERS,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(GITHUB_COPILOT_USER_URL, headers=headers)
+        if resp.status_code in {401, 403, 404}:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+
+    snapshots = data.get("quota_snapshots", {}) or {}
+    premium = snapshots.get("premium_interactions", {}) or {}
+    if not premium:
+        return None
+
+    return CopilotUsageSnapshot(
+        limit=_coerce_int(premium.get("entitlement")),
+        remaining=_coerce_int(premium.get("remaining")),
+        percent_remaining=_coerce_float(premium.get("percent_remaining")),
+        reset_at=_parse_timestamp(
+            data.get("quota_reset_date_utc") or data.get("quota_reset_date")
+        ),
+        observed_at=_parse_timestamp(premium.get("timestamp_utc")) or time.time(),
+    )
+
+
+def _coerce_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_timestamp(value: str | None) -> float:
+    if not value:
+        return 0.0
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return 0.0
 
 
 _fetch_copilot_token = fetch_copilot_token

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 import httpx
@@ -21,6 +23,24 @@ from copilotx.config import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class RateLimitSnapshot:
+    """Best-effort upstream request quota visibility."""
+
+    limit: int | None = None
+    remaining: int | None = None
+    reset_at: float | None = None
+    retry_after_seconds: float | None = None
+    source: str = ""
+    observed_at: float = 0.0
+
+    @property
+    def known(self) -> bool:
+        return any(
+            value is not None for value in (self.limit, self.remaining, self.reset_at)
+        )
+
+
 class CopilotClient:
     """Async client that talks to the Copilot API (dynamic base URL)."""
 
@@ -31,6 +51,7 @@ class CopilotClient:
         # Model cache
         self._models_cache: list[dict] | None = None
         self._models_cache_time: float = 0
+        self._last_rate_limit: RateLimitSnapshot | None = None
 
     async def __aenter__(self) -> "CopilotClient":
         self._client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
@@ -48,6 +69,10 @@ class CopilotClient:
         """Update the API base URL (called after token refresh if changed)."""
         if api_base_url:
             self._api_base = api_base_url.rstrip("/")
+
+    @property
+    def last_rate_limit(self) -> RateLimitSnapshot | None:
+        return self._last_rate_limit
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = {
@@ -70,6 +95,7 @@ class CopilotClient:
         assert self._client is not None
         url = f"{self._api_base}{COPILOT_MODELS_PATH}"
         resp = await self._client.get(url, headers=self._headers())
+        self._record_rate_limit(resp.headers)
         resp.raise_for_status()
         data = resp.json()
 
@@ -89,6 +115,7 @@ class CopilotClient:
         assert self._client is not None
         url = f"{self._api_base}{COPILOT_CHAT_COMPLETIONS_PATH}"
         resp = await self._client.post(url, json=payload, headers=self._headers())
+        self._record_rate_limit(resp.headers)
         if resp.status_code >= 400:
             error_body = resp.text
             logger.error(
@@ -113,6 +140,7 @@ class CopilotClient:
         async with self._client.stream(
             "POST", url, json=payload, headers=self._headers(),
         ) as resp:
+            self._record_rate_limit(resp.headers)
             if resp.status_code >= 400:
                 error_body = await resp.aread()
                 logger.error(
@@ -153,6 +181,7 @@ class CopilotClient:
         resp = await self._client.post(
             url, json=payload, headers=self._headers(extra_headers),
         )
+        self._record_rate_limit(resp.headers)
         if resp.status_code >= 400:
             error_body = resp.text
             logger.error(
@@ -186,6 +215,7 @@ class CopilotClient:
         async with self._client.stream(
             "POST", url, json=payload, headers=self._headers(extra_headers),
         ) as resp:
+            self._record_rate_limit(resp.headers)
             if resp.status_code >= 400:
                 error_body = await resp.aread()
                 logger.error(
@@ -213,3 +243,99 @@ class CopilotClient:
         if vision:
             h["copilot-vision-request"] = "true"
         return h
+
+    def _record_rate_limit(self, headers: httpx.Headers) -> None:
+        snapshot = self._parse_rate_limit(headers)
+        if snapshot is None:
+            return
+
+        previous = self._last_rate_limit
+        if previous is None:
+            self._last_rate_limit = snapshot
+            return
+
+        self._last_rate_limit = RateLimitSnapshot(
+            limit=previous.limit if snapshot.limit is None else snapshot.limit,
+            remaining=(
+                previous.remaining if snapshot.remaining is None else snapshot.remaining
+            ),
+            reset_at=previous.reset_at if snapshot.reset_at is None else snapshot.reset_at,
+            retry_after_seconds=(
+                previous.retry_after_seconds
+                if snapshot.retry_after_seconds is None
+                else snapshot.retry_after_seconds
+            ),
+            source=snapshot.source or previous.source,
+            observed_at=snapshot.observed_at or previous.observed_at,
+        )
+
+    def _parse_rate_limit(self, headers: httpx.Headers) -> RateLimitSnapshot | None:
+        now = time.time()
+        limit, limit_source = self._parse_header_number(
+            headers,
+            ("x-ratelimit-limit", "ratelimit-limit"),
+        )
+        remaining, remaining_source = self._parse_header_number(
+            headers,
+            ("x-ratelimit-remaining", "ratelimit-remaining"),
+        )
+        reset_value, reset_source = self._parse_header_number(
+            headers,
+            ("x-ratelimit-reset", "ratelimit-reset"),
+        )
+        retry_after, retry_source = self._parse_header_number(headers, ("retry-after",))
+
+        if (
+            limit is None
+            and remaining is None
+            and reset_value is None
+            and retry_after is None
+        ):
+            return None
+
+        reset_at: float | None = None
+        if reset_value is not None:
+            reset_at = reset_value if reset_value >= 1_000_000_000 else now + reset_value
+        elif retry_after is not None:
+            reset_at = now + retry_after
+
+        source = next(
+            (
+                header_source
+                for header_source in (
+                    limit_source,
+                    remaining_source,
+                    reset_source,
+                    retry_source,
+                )
+                if header_source
+            ),
+            "",
+        )
+
+        return RateLimitSnapshot(
+            limit=limit,
+            remaining=remaining,
+            reset_at=reset_at,
+            retry_after_seconds=retry_after,
+            source=source,
+            observed_at=now,
+        )
+
+    @staticmethod
+    def _parse_header_number(
+        headers: httpx.Headers,
+        names: tuple[str, ...],
+    ) -> tuple[int | None, str]:
+        for name in names:
+            raw_value = headers.get(name)
+            if not raw_value:
+                continue
+            match = re.search(r"-?\d+(?:\.\d+)?", raw_value)
+            if not match:
+                continue
+            value = float(match.group(0))
+            if value < 0:
+                continue
+            return int(value), name
+        return None, ""
