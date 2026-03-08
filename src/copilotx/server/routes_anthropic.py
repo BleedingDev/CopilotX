@@ -23,7 +23,7 @@ from copilotx.proxy.translator import (
     openai_stream_to_anthropic_stream,
     openai_to_anthropic_response,
 )
-from copilotx.server.app import run_with_runtime, stream_with_runtime
+from copilotx.server.app import probe_with_runtime, run_with_runtime, stream_with_runtime
 from copilotx.server.request_features import (
     responses_request_has_vision_input,
     responses_request_initiator,
@@ -83,7 +83,7 @@ async def messages(request: Request):
             if preferred_api == RESPONSES_API:
                 try:
                     responses_payload.pop("stream", None)
-                    responses_resp = await run_with_runtime(
+                    responses_resp = await probe_with_runtime(
                         request.app.state,
                         model=model,
                         operation=lambda client: client.responses(
@@ -151,7 +151,7 @@ async def messages(request: Request):
 
         if preferred_api == RESPONSES_API:
             try:
-                responses_resp = await run_with_runtime(
+                responses_resp = await probe_with_runtime(
                     request.app.state,
                     model=model,
                     operation=lambda client: client.responses(

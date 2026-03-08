@@ -131,6 +131,13 @@ class AppRuntime(Protocol):
         operation: Callable[[CopilotClient], Awaitable[Any]],
     ) -> Any: ...
 
+    async def probe(
+        self,
+        *,
+        model: str | None,
+        operation: Callable[[CopilotClient], Awaitable[Any]],
+    ) -> Any: ...
+
     async def stream(
         self,
         *,
@@ -175,6 +182,14 @@ class LegacyRuntime:
     ) -> Any:
         client = await self._get_ready_client()
         return await operation(client)
+
+    async def probe(
+        self,
+        *,
+        model: str | None,
+        operation: Callable[[CopilotClient], Awaitable[Any]],
+    ) -> Any:
+        return await self.execute(model=model, operation=operation)
 
     async def stream(
         self,
@@ -238,6 +253,14 @@ class PoolRuntime:
         operation: Callable[[CopilotClient], Awaitable[Any]],
     ) -> Any:
         return await self.pool.execute(model=model, operation=operation)
+
+    async def probe(
+        self,
+        *,
+        model: str | None,
+        operation: Callable[[CopilotClient], Awaitable[Any]],
+    ) -> Any:
+        return await self.pool.probe(model=model, operation=operation)
 
     async def stream(
         self,

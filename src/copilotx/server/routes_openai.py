@@ -20,7 +20,7 @@ from copilotx.proxy.translator import (
     openai_responses_to_chat_response,
     openai_responses_to_chat_stream,
 )
-from copilotx.server.app import run_with_runtime, stream_with_runtime
+from copilotx.server.app import probe_with_runtime, run_with_runtime, stream_with_runtime
 from copilotx.server.request_features import (
     responses_request_has_vision_input,
     responses_request_initiator,
@@ -58,13 +58,14 @@ async def chat_completions(request: Request):
     initiator = responses_request_initiator(responses_payload)
     runtime = request.app.state.runtime
     preferred_api = runtime.preferred_api_surface(model, CHAT_COMPLETIONS_API)
+    preferred_responses_error: Exception | None = None
 
     try:
         if body.get("stream", False):
             if preferred_api == RESPONSES_API:
                 try:
                     responses_payload.pop("stream", None)
-                    responses_result = await run_with_runtime(
+                    responses_result = await probe_with_runtime(
                         request.app.state,
                         model=model,
                         operation=lambda client: client.responses(
@@ -76,9 +77,10 @@ async def chat_completions(request: Request):
                     runtime.mark_api_success(model, RESPONSES_API)
                     return sse_response(openai_responses_to_chat_stream(responses_result))
                 except Exception as responses_error:
-                    if not is_responses_unsupported_for_model(responses_error):
-                        raise
-                    runtime.mark_api_unsupported(model, RESPONSES_API)
+                    if is_responses_unsupported_for_model(responses_error):
+                        runtime.mark_api_unsupported(model, RESPONSES_API)
+                    else:
+                        preferred_responses_error = responses_error
 
             try:
                 openai_stream = stream_with_runtime(
@@ -95,6 +97,8 @@ async def chat_completions(request: Request):
                 if not is_chat_completions_unsupported_for_model(stream_error):
                     raise
                 runtime.mark_api_unsupported(model, CHAT_COMPLETIONS_API)
+                if preferred_responses_error is not None:
+                    raise preferred_responses_error
 
                 responses_payload.pop("stream", None)
                 responses_result = await run_with_runtime(
@@ -111,7 +115,7 @@ async def chat_completions(request: Request):
 
         if preferred_api == RESPONSES_API:
             try:
-                responses_result = await run_with_runtime(
+                responses_result = await probe_with_runtime(
                     request.app.state,
                     model=model,
                     operation=lambda client: client.responses(
@@ -123,9 +127,10 @@ async def chat_completions(request: Request):
                 runtime.mark_api_success(model, RESPONSES_API)
                 return JSONResponse(content=openai_responses_to_chat_response(responses_result))
             except Exception as responses_error:
-                if not is_responses_unsupported_for_model(responses_error):
-                    raise
-                runtime.mark_api_unsupported(model, RESPONSES_API)
+                if is_responses_unsupported_for_model(responses_error):
+                    runtime.mark_api_unsupported(model, RESPONSES_API)
+                else:
+                    preferred_responses_error = responses_error
 
         try:
             result = await run_with_runtime(
@@ -139,6 +144,8 @@ async def chat_completions(request: Request):
             if not is_chat_completions_unsupported_for_model(non_stream_error):
                 raise
             runtime.mark_api_unsupported(model, CHAT_COMPLETIONS_API)
+            if preferred_responses_error is not None:
+                raise preferred_responses_error
 
             responses_result = await run_with_runtime(
                 request.app.state,

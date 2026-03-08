@@ -156,6 +156,17 @@ async def run_with_runtime(
     return await runtime.execute(model=model, operation=operation)
 
 
+async def probe_with_runtime(
+    app_state,
+    *,
+    model: str | None,
+    operation: Callable[[CopilotClient], Awaitable[Any]],
+) -> Any:
+    """Run a best-effort runtime probe without mutating runtime health on failure."""
+    runtime: AppRuntime = app_state.runtime
+    return await runtime.probe(model=model, operation=operation)
+
+
 async def stream_with_runtime(
     app_state,
     *,
