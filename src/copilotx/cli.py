@@ -51,6 +51,10 @@ def _format_duration(seconds: int) -> str:
     return f"{secs}s"
 
 
+def _format_tokens(value: int) -> str:
+    return f"{max(int(value), 0):,}"
+
+
 def _format_request_budget(limit: int | None, remaining: int | None) -> str:
     if limit is None and remaining is None:
         return "unknown"
@@ -66,6 +70,12 @@ def _format_reset_time(reset_at: float, now: float) -> str:
     if reset_at <= 0:
         return "-"
     return _format_duration(max(int(reset_at - now), 0))
+
+
+def _format_seen_at(timestamp: float) -> str:
+    if timestamp <= 0:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(timestamp))
 
 
 def _observed_budget_summary(accounts: list) -> str:
@@ -189,6 +199,58 @@ def _render_account_table(repo) -> None:
             _format_request_budget(account.request_limit, account.request_remaining),
             _format_reset_time(account.request_reset_at, now),
             str(account.priority),
+        )
+
+    console.print(table)
+
+
+def _render_usage_report(repo) -> None:
+    summary = repo.usage_summary(enabled_only=True)
+    if summary.request_count <= 0:
+        console.print("[yellow]⚠️  No observed token usage yet[/]")
+        console.print(
+            "[dim]   Exact token tracking starts with new requests after this version.[/]"
+        )
+        return
+
+    console.print("[bold green]📊 Observed token usage[/]")
+    console.print(
+        "[dim]   Requests: "
+        f"{_format_tokens(summary.request_count)} across "
+        f"{summary.accounts_observed} account(s) and {summary.models_observed} model(s)[/]"
+    )
+    console.print(
+        "[dim]   Input: "
+        f"{_format_tokens(summary.input_tokens)}"
+        f" | Cached input: {_format_tokens(summary.cached_input_tokens)}"
+        f" | Output: {_format_tokens(summary.output_tokens)}"
+        f" | Total: {_format_tokens(summary.total_tokens)}[/]"
+    )
+    if summary.first_seen_at > 0:
+        console.print(f"[dim]   Since: {_format_seen_at(summary.first_seen_at)}[/]")
+
+    table = Table(title="Observed Token Usage by Account", show_lines=False)
+    table.add_column("Account", style="cyan", no_wrap=True)
+    table.add_column("GitHub", style="white")
+    table.add_column("Requests", style="white", justify="right")
+    table.add_column("Input", style="white", justify="right")
+    table.add_column("Cached", style="white", justify="right")
+    table.add_column("Output", style="white", justify="right")
+    table.add_column("Total", style="magenta", justify="right")
+    table.add_column("Last Seen", style="dim")
+
+    for account in repo.account_usage_summaries(enabled_only=False):
+        if account.request_count <= 0:
+            continue
+        table.add_row(
+            account.label,
+            account.github_login or "legacy",
+            _format_tokens(account.request_count),
+            _format_tokens(account.input_tokens),
+            _format_tokens(account.cached_input_tokens),
+            _format_tokens(account.output_tokens),
+            _format_tokens(account.total_tokens),
+            _format_seen_at(account.last_seen_at),
         )
 
     console.print(table)
@@ -341,6 +403,17 @@ def auth_status() -> None:
         console.print(f"[dim]   Copilot token valid ({mins}m {secs}s remaining)[/]")
     else:
         console.print("[yellow]   Copilot token expired (will auto-refresh on next request)[/]")
+
+
+@auth_app.command("usage")
+def auth_usage() -> None:
+    """Show observed token usage across all configured accounts."""
+    repo = _account_repository()
+    if not repo.has_accounts():
+        console.print("[bold red]❌ Not authenticated[/]")
+        console.print("[dim]   Run: copilotx auth login[/]")
+        raise typer.Exit(1)
+    _render_usage_report(repo)
 
 
 @auth_app.command("logout")

@@ -477,6 +477,97 @@ def test_render_account_table_shows_per_account_request_budget(tmp_path: Path) -
     assert "unknown" in output
 
 
+def test_account_repository_usage_rollups_aggregate_totals(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+    repo.upsert_account(make_account("acct-2", "beta", "gh-2", "token-2"))
+
+    repo.record_usage(
+        "acct-1",
+        model="gpt-5-mini",
+        input_tokens=10,
+        cached_input_tokens=4,
+        output_tokens=3,
+        total_tokens=13,
+        observed_at=100,
+    )
+    repo.record_usage(
+        "acct-1",
+        model="claude-haiku-4.5",
+        input_tokens=7,
+        cached_input_tokens=2,
+        output_tokens=1,
+        total_tokens=8,
+        observed_at=110,
+    )
+    repo.record_usage(
+        "acct-2",
+        model="gpt-5-mini",
+        input_tokens=5,
+        cached_input_tokens=1,
+        output_tokens=2,
+        total_tokens=7,
+        observed_at=120,
+    )
+
+    summary = repo.usage_summary()
+    accounts = repo.account_usage_summaries()
+
+    assert summary.accounts_observed == 2
+    assert summary.models_observed == 3
+    assert summary.request_count == 3
+    assert summary.input_tokens == 22
+    assert summary.cached_input_tokens == 7
+    assert summary.output_tokens == 6
+    assert summary.total_tokens == 28
+    assert summary.first_seen_at == 100
+    assert summary.last_seen_at == 120
+    assert accounts[0].label == "alpha"
+    assert accounts[0].request_count == 2
+    assert accounts[0].total_tokens == 21
+    assert accounts[1].label == "beta"
+    assert accounts[1].request_count == 1
+    assert accounts[1].total_tokens == 7
+
+
+def test_render_usage_report_shows_combined_and_per_account_totals(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+    repo.upsert_account(make_account("acct-2", "beta", "gh-2", "token-2"))
+    repo.record_usage(
+        "acct-1",
+        model="gpt-5-mini",
+        input_tokens=12,
+        cached_input_tokens=5,
+        output_tokens=4,
+        total_tokens=16,
+        observed_at=100,
+    )
+    repo.record_usage(
+        "acct-2",
+        model="claude-haiku-4.5",
+        input_tokens=7,
+        cached_input_tokens=0,
+        output_tokens=2,
+        total_tokens=9,
+        observed_at=110,
+    )
+
+    original_console = cli_module.console
+    cli_module.console = Console(record=True, width=180)
+    try:
+        cli_module._render_usage_report(repo)
+        output = cli_module.console.export_text()
+    finally:
+        cli_module.console = original_console
+
+    assert "Observed token usage" in output
+    assert "Requests: 2 across 2 account(s) and 2 model(s)" in output
+    assert "Input: 19 | Cached input: 5 | Output: 6 | Total: 25" in output
+    assert "alpha" in output
+    assert "beta" in output
+
+
 def test_api_key_middleware_trusts_localhost_by_default(
     tmp_path: Path,
     monkeypatch,
@@ -511,6 +602,97 @@ def test_api_key_middleware_trusts_localhost_by_default(
 
     assert response.status_code == 200
     assert response.json()["data"][0]["id"] == "gpt-5.4"
+
+
+def test_responses_route_records_non_stream_usage(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5-mini"],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_result": {
+                "id": "resp_1",
+                "model": "gpt-5-mini",
+                "output": [],
+                "usage": {
+                    "input_tokens": 11,
+                    "input_tokens_details": {"cached_tokens": 3},
+                    "output_tokens": 4,
+                    "total_tokens": 15,
+                },
+            },
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": "gpt-5-mini", "input": "hello"},
+        )
+
+    assert response.status_code == 200
+    summary = repo.usage_summary()
+    assert summary.request_count == 1
+    assert summary.input_tokens == 11
+    assert summary.cached_input_tokens == 3
+    assert summary.output_tokens == 4
+    assert summary.total_tokens == 15
+
+
+def test_responses_route_records_stream_usage_from_completed_event(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5-mini"],
+            "errors": [],
+            "chat_calls": 0,
+            "responses_stream_chunks": [
+                b"event: response.completed\n",
+                (
+                    b'data: {"type":"response.completed","response":{"id":"resp_1",'
+                    b'"model":"gpt-5-mini","usage":{"input_tokens":9,'
+                    b'"input_tokens_details":{"cached_tokens":2},'
+                    b'"output_tokens":5,"total_tokens":14}}}\n'
+                ),
+                b"\n",
+                b"data: [DONE]\n",
+                b"\n",
+            ],
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": "gpt-5-mini", "input": "hello", "stream": True},
+        )
+
+    assert response.status_code == 200
+    summary = repo.usage_summary()
+    assert summary.request_count == 1
+    assert summary.input_tokens == 9
+    assert summary.cached_input_tokens == 2
+    assert summary.output_tokens == 5
+    assert summary.total_tokens == 14
 
 
 def test_api_key_middleware_can_require_auth_on_localhost(

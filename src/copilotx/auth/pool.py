@@ -22,6 +22,7 @@ from copilotx.config import (
     TOKEN_REFRESH_BUFFER,
 )
 from copilotx.proxy.client import CopilotClient
+from copilotx.usage import UsageRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -134,10 +135,12 @@ class TokenPool:
         *,
         client_factory: Callable[[str, str], CopilotClient] = CopilotClient,
         token_fetcher: Callable[[str], Awaitable[tuple[str, float, str]]] = fetch_copilot_token,
+        usage_recorder: UsageRecorder | None = None,
     ) -> None:
         self.repository = repository
         self.client_factory = client_factory
         self.token_fetcher = token_fetcher
+        self.usage_recorder = usage_recorder or UsageRecorder(repository)
         self.entries: dict[str, PoolEntry] = {}
         self._selection_lock = asyncio.Lock()
         self._round_robin_cursor = 0
@@ -347,6 +350,11 @@ class TokenPool:
             )
             try:
                 result = await operation(lease.client)
+                self.usage_recorder.record_payload(
+                    lease.account_id,
+                    result,
+                    model_hint=model,
+                )
                 await self._mark_success(lease.entry)
                 return result
             except Exception as exc:
@@ -357,6 +365,11 @@ class TokenPool:
                     try:
                         await self._force_refresh_entry(lease.entry)
                         result = await operation(lease.client)
+                        self.usage_recorder.record_payload(
+                            lease.account_id,
+                            result,
+                            model_hint=model,
+                        )
                         await self._mark_success(lease.entry)
                         return result
                     except Exception as retry_exc:
@@ -386,6 +399,11 @@ class TokenPool:
         )
         try:
             result = await operation(lease.client)
+            self.usage_recorder.record_payload(
+                lease.account_id,
+                result,
+                model_hint=model,
+            )
             await self._mark_success(lease.entry)
             return result
         finally:
@@ -411,7 +429,12 @@ class TokenPool:
             )
             yielded = False
             try:
-                async for chunk in operation(lease.client):
+                tracked_stream = self.usage_recorder.wrap_stream(
+                    lease.account_id,
+                    operation(lease.client),
+                    model_hint=model,
+                )
+                async for chunk in tracked_stream:
                     yielded = True
                     yield chunk
                 await self._mark_success(lease.entry)
@@ -424,7 +447,12 @@ class TokenPool:
                     lease.force_refreshed = True
                     try:
                         await self._force_refresh_entry(lease.entry)
-                        async for chunk in operation(lease.client):
+                        tracked_stream = self.usage_recorder.wrap_stream(
+                            lease.account_id,
+                            operation(lease.client),
+                            model_hint=model,
+                        )
+                        async for chunk in tracked_stream:
                             yielded = True
                             yield chunk
                         await self._mark_success(lease.entry)

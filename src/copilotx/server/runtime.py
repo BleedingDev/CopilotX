@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Protocol, runtime_checkable
 
+from copilotx.auth.accounts import AccountRepository
 from copilotx.auth.pool import TokenPool
 from copilotx.auth.token import TokenManager
 from copilotx.proxy.client import CopilotClient
+from copilotx.usage import UsageRecorder
 
 CHAT_COMPLETIONS_API = "chat_completions"
 RESPONSES_API = "responses"
@@ -162,6 +164,8 @@ class LegacyRuntime:
     def __init__(self, token_manager: TokenManager) -> None:
         self.token_manager = token_manager
         self.client: CopilotClient | None = None
+        self.repository = AccountRepository()
+        self.usage_recorder = UsageRecorder(self.repository)
         self.routing = ModelRoutingRegistry()
 
     async def startup(self) -> None:
@@ -181,7 +185,13 @@ class LegacyRuntime:
         operation: Callable[[CopilotClient], Awaitable[Any]],
     ) -> Any:
         client = await self._get_ready_client()
-        return await operation(client)
+        result = await operation(client)
+        self.usage_recorder.record_payload(
+            self._current_account_id(),
+            result,
+            model_hint=model,
+        )
+        return result
 
     async def probe(
         self,
@@ -198,7 +208,12 @@ class LegacyRuntime:
         operation: Callable[[CopilotClient], AsyncIterator[bytes]],
     ) -> AsyncIterator[bytes]:
         client = await self._get_ready_client()
-        async for chunk in operation(client):
+        tracked_stream = self.usage_recorder.wrap_stream(
+            self._current_account_id(),
+            operation(client),
+            model_hint=model,
+        )
+        async for chunk in tracked_stream:
             yield chunk
 
     async def list_models(self) -> list[dict[str, Any]]:
@@ -231,6 +246,13 @@ class LegacyRuntime:
         self.client.update_token(token)
         self.client.update_api_base(self.token_manager.api_base_url)
         return self.client
+
+    def _current_account_id(self) -> str:
+        account_id = self.repository.get_default_account_id()
+        if account_id:
+            return account_id
+        accounts = self.repository.list_accounts(enabled_only=True)
+        return accounts[0].account_id if accounts else ""
 
 
 class PoolRuntime:

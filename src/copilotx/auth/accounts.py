@@ -53,6 +53,38 @@ class AccountRecord:
         return self.label or self.github_login or self.account_id
 
 
+@dataclass(slots=True)
+class UsageSummary:
+    """Aggregate observed token usage."""
+
+    accounts_observed: int = 0
+    models_observed: int = 0
+    request_count: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    first_seen_at: float = 0.0
+    last_seen_at: float = 0.0
+
+
+@dataclass(slots=True)
+class AccountUsageSummary:
+    """Observed token usage for one configured account."""
+
+    account_id: str
+    label: str
+    github_login: str
+    enabled: bool
+    request_count: int = 0
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    first_seen_at: float = 0.0
+    last_seen_at: float = 0.0
+
+
 class AccountRepository:
     """Persistent registry for all configured upstream accounts."""
 
@@ -219,6 +251,10 @@ class AccountRepository:
             return False
         with self._connect() as conn:
             conn.execute("DELETE FROM accounts WHERE account_id = ?", (account.account_id,))
+            conn.execute(
+                "DELETE FROM usage_rollups WHERE account_id = ?",
+                (account.account_id,),
+            )
         if self.get_default_account_id() == account.account_id:
             next_default = self.list_accounts(enabled_only=True)
             self.set_default_account_id(next_default[0].account_id if next_default else "")
@@ -229,6 +265,7 @@ class AccountRepository:
         count = self.count_accounts()
         with self._connect() as conn:
             conn.execute("DELETE FROM accounts")
+            conn.execute("DELETE FROM usage_rollups")
             conn.execute("DELETE FROM settings WHERE key = 'default_account_id'")
         self.sync_legacy_auth_file()
         return count
@@ -387,6 +424,144 @@ class AccountRepository:
             )
         self.sync_legacy_auth_file()
 
+    def record_usage(
+        self,
+        account_id: str,
+        *,
+        model: str,
+        input_tokens: int,
+        cached_input_tokens: int,
+        output_tokens: int,
+        total_tokens: int,
+        observed_at: float | None = None,
+    ) -> None:
+        account = self.get_account(account_id)
+        if account is None:
+            return
+
+        model = (model or "unknown").strip() or "unknown"
+        observed_at = time.time() if observed_at is None else observed_at
+        input_tokens = max(int(input_tokens), 0)
+        cached_input_tokens = max(int(cached_input_tokens), 0)
+        output_tokens = max(int(output_tokens), 0)
+        total_tokens = max(int(total_tokens), 0)
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_rollups (
+                    account_id,
+                    model,
+                    request_count,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    first_seen_at,
+                    last_seen_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, model) DO UPDATE SET
+                    request_count = usage_rollups.request_count + 1,
+                    input_tokens = usage_rollups.input_tokens + excluded.input_tokens,
+                    cached_input_tokens = (
+                        usage_rollups.cached_input_tokens + excluded.cached_input_tokens
+                    ),
+                    output_tokens = usage_rollups.output_tokens + excluded.output_tokens,
+                    total_tokens = usage_rollups.total_tokens + excluded.total_tokens,
+                    first_seen_at = CASE
+                        WHEN usage_rollups.first_seen_at = 0 THEN excluded.first_seen_at
+                        ELSE MIN(usage_rollups.first_seen_at, excluded.first_seen_at)
+                    END,
+                    last_seen_at = MAX(usage_rollups.last_seen_at, excluded.last_seen_at)
+                """,
+                (
+                    account_id,
+                    model,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    observed_at,
+                    observed_at,
+                ),
+            )
+
+    def usage_summary(self, *, enabled_only: bool = False) -> UsageSummary:
+        join_clause = "JOIN accounts a ON a.account_id = u.account_id"
+        where_clause = "WHERE a.enabled = 1" if enabled_only else ""
+        query = f"""
+            SELECT
+                COUNT(DISTINCT u.account_id) AS accounts_observed,
+                COUNT(*) AS models_observed,
+                COALESCE(SUM(u.request_count), 0) AS request_count,
+                COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(u.cached_input_tokens), 0) AS cached_input_tokens,
+                COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
+                COALESCE(MIN(NULLIF(u.first_seen_at, 0)), 0) AS first_seen_at,
+                COALESCE(MAX(u.last_seen_at), 0) AS last_seen_at
+            FROM usage_rollups u
+            {join_clause}
+            {where_clause}
+        """
+        with self._connect() as conn:
+            row = conn.execute(query).fetchone()
+        return UsageSummary(
+            accounts_observed=int(row["accounts_observed"] or 0),
+            models_observed=int(row["models_observed"] or 0),
+            request_count=int(row["request_count"] or 0),
+            input_tokens=int(row["input_tokens"] or 0),
+            cached_input_tokens=int(row["cached_input_tokens"] or 0),
+            output_tokens=int(row["output_tokens"] or 0),
+            total_tokens=int(row["total_tokens"] or 0),
+            first_seen_at=float(row["first_seen_at"] or 0.0),
+            last_seen_at=float(row["last_seen_at"] or 0.0),
+        )
+
+    def account_usage_summaries(
+        self,
+        *,
+        enabled_only: bool = False,
+    ) -> list[AccountUsageSummary]:
+        where_clause = "WHERE a.enabled = 1" if enabled_only else ""
+        query = f"""
+            SELECT
+                a.account_id,
+                a.label,
+                a.github_login,
+                a.enabled,
+                COALESCE(SUM(u.request_count), 0) AS request_count,
+                COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(u.cached_input_tokens), 0) AS cached_input_tokens,
+                COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
+                COALESCE(MIN(NULLIF(u.first_seen_at, 0)), 0) AS first_seen_at,
+                COALESCE(MAX(u.last_seen_at), 0) AS last_seen_at
+            FROM accounts a
+            LEFT JOIN usage_rollups u ON u.account_id = a.account_id
+            {where_clause}
+            GROUP BY a.account_id, a.label, a.github_login, a.enabled, a.priority, a.created_at
+            ORDER BY a.priority ASC, a.created_at ASC, a.account_id ASC
+        """
+        with self._connect() as conn:
+            rows = conn.execute(query).fetchall()
+        return [
+            AccountUsageSummary(
+                account_id=str(row["account_id"]),
+                label=str(row["label"]),
+                github_login=str(row["github_login"]),
+                enabled=bool(row["enabled"]),
+                request_count=int(row["request_count"] or 0),
+                input_tokens=int(row["input_tokens"] or 0),
+                cached_input_tokens=int(row["cached_input_tokens"] or 0),
+                output_tokens=int(row["output_tokens"] or 0),
+                total_tokens=int(row["total_tokens"] or 0),
+                first_seen_at=float(row["first_seen_at"] or 0.0),
+                last_seen_at=float(row["last_seen_at"] or 0.0),
+            )
+            for row in rows
+        ]
+
     def get_rotation_strategy(self) -> str:
         value = self.get_setting("rotation_strategy", DEFAULT_ROTATION_STRATEGY)
         if value not in ROTATION_STRATEGIES:
@@ -493,6 +668,22 @@ class AccountRepository:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS usage_rollups (
+                    account_id TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT 'unknown',
+                    request_count INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    first_seen_at REAL NOT NULL DEFAULT 0,
+                    last_seen_at REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(account_id, model)
                 )
                 """
             )
