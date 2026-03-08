@@ -47,7 +47,7 @@ copilotx serve
 
 Output:
 ```
-🚀 CopilotX v2.3.3
+🚀 CopilotX v3.0.0
 ✅ Copilot Token valid (28m remaining, auto-refresh)
 � Local mode (localhost only)
 🎯 API: api.enterprise.githubcopilot.com (auto-detected)
@@ -346,7 +346,8 @@ client = OpenAI(
 | v2.1.0 | Codex | Responses API, vision support, dynamic API URL, stream ID sync |
 | v2.2.0 | Config | `copilotx config` command for client setup (Claude Code) |
 | **v2.3.x** | **Polish** | **Error passthrough, stream error handling, test suite** |
-| v3.0.0 | Multi-User | Token pool, user database, OpenRouter mode |
+| **v3.0.0** | **Multi-User** | **Token pool, user database, account rotation** |
+| v3.1.0 | OpenRouter | OpenRouter mode |
 
 ## ⚠️ Disclaimer
 
