@@ -23,7 +23,7 @@ from copilotx.proxy.translator import (
     openai_chat_to_responses_stream,
     openai_responses_to_chat_request,
 )
-from copilotx.server.app import run_with_runtime, stream_with_runtime
+from copilotx.server.app import probe_with_runtime, run_with_runtime, stream_with_runtime
 from copilotx.server.request_features import (
     responses_request_has_vision_input,
     responses_request_initiator,
@@ -59,18 +59,18 @@ async def responses(request: Request):
     vision = responses_request_has_vision_input(body)
     initiator = responses_request_initiator(body)
     model = body.get("model")
-    chat_payload = openai_responses_to_chat_request(body)
     runtime = request.app.state.runtime
     preferred_api = runtime.preferred_api_surface(model, RESPONSES_API)
 
     # Patch apply_patch tool (custom → function type)
     patch_apply_patch_tool(body)
+    chat_payload = openai_responses_to_chat_request(body)
 
     try:
         if body.get("stream", False):
             if preferred_api == CHAT_COMPLETIONS_API:
                 try:
-                    chat_result = await run_with_runtime(
+                    chat_result = await probe_with_runtime(
                         request.app.state,
                         model=model,
                         operation=lambda client: client.chat_completions(
@@ -114,7 +114,7 @@ async def responses(request: Request):
 
         if preferred_api == CHAT_COMPLETIONS_API:
             try:
-                chat_result = await run_with_runtime(
+                chat_result = await probe_with_runtime(
                     request.app.state,
                     model=model,
                     operation=lambda client: client.chat_completions(

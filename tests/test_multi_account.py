@@ -870,6 +870,64 @@ def test_openai_route_prefers_responses_for_gpt5_without_chat_probe(
     assert state["token-1"]["responses_calls"] == 1
 
 
+def test_openai_route_falls_back_to_requested_chat_surface_when_preferred_responses_fails(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["gpt-5.4"],
+            "errors": [],
+            "responses_errors": [make_http_error(500, "temporary responses failure")],
+            "chat_result": {
+                "id": "chat-after-responses-failure-1",
+                "object": "chat.completion",
+                "created": 1772973003,
+                "model": "gpt-5.4",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "chat fallback ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 3,
+                    "total_tokens": 11,
+                },
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: FakeCopilotClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "Say hello."}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "chat fallback ok"
+    assert state["token-1"]["responses_calls"] == 1
+    assert state["token-1"]["chat_calls"] == 1
+
+
 def test_responses_route_prefers_chat_for_claude_without_responses_probe(
     tmp_path: Path,
 ) -> None:
@@ -924,6 +982,75 @@ def test_responses_route_prefers_chat_for_claude_without_responses_probe(
     assert response.status_code == 200
     assert response.json()["output"][0]["content"][0]["text"] == "direct chat ok"
     assert state["token-1"].get("responses_calls", 0) == 0
+    assert state["token-1"]["chat_calls"] == 1
+
+
+def test_responses_route_preserves_apply_patch_tool_on_chat_surface(
+    tmp_path: Path,
+) -> None:
+    repo, _ = make_repo(tmp_path)
+    repo.upsert_account(make_account("acct-1", "alpha", "gh-1", "token-1"))
+
+    captured: dict[str, dict] = {}
+    state = {
+        "token-1": {
+            "name": "alpha",
+            "models": ["claude-sonnet-4.6"],
+            "errors": [],
+            "chat_result": {
+                "id": "chat-apply-patch-1",
+                "object": "chat.completion",
+                "created": 1772973004,
+                "model": "claude-sonnet-4.6",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "tool ok",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                },
+            },
+            "chat_calls": 0,
+        }
+    }
+
+    class CapturingClient(FakeCopilotClient):
+        async def chat_completions(self, payload: dict) -> dict:
+            captured["payload"] = copy.deepcopy(payload)
+            return await super().chat_completions(payload)
+
+    pool = TokenPool(
+        repo,
+        client_factory=lambda token, api_base: CapturingClient(token, api_base, state),
+    )
+    app = create_app(pool)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "claude-sonnet-4.6",
+                "input": "Apply this patch.",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["payload"]["tools"][0]["type"] == "function"
+    assert captured["payload"]["tools"][0]["function"]["name"] == "apply_patch"
     assert state["token-1"]["chat_calls"] == 1
 
 
